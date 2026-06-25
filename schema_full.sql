@@ -4,7 +4,7 @@ CREATE SCHEMA IF NOT EXISTS data;
 
 CREATE TABLE data.did_query_full (
     line VARCHAR(10) NOT NULL,
-    csv_date TIMESTAMPTZ NOT NULL,
+    csv_date TIMESTAMP WITHOUT TIME ZONE NOT NULL,
     col_01 TEXT,
     col_02 TEXT,
     did TEXT,

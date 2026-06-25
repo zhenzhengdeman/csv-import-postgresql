@@ -24,7 +24,7 @@ ON data.import_log (line, status);
 
 CREATE TABLE data.did_query (
     line VARCHAR(10) NOT NULL,
-    csv_date TIMESTAMPTZ NOT NULL,
+    csv_date TIMESTAMP WITHOUT TIME ZONE NOT NULL,
     did TEXT,
     gcode TEXT
 );

@@ -7,7 +7,7 @@ Key rules:
 - The data table stores line, csv_date, did, and gcode only.
 - This script does not create the database or tables by default.
 - line is shortened from PT-L08 to L08.
-- csv_date is a timezone-aware timestamp, parsed from folders and SIDTrace_HH.csv.
+- csv_date is a timestamp without time zone, parsed from folders and SIDTrace_HH.csv.
 - Full mode imports actual files first, then audits expected hourly files from
   AUDIT_START_DATE and writes status=missing when the file does not exist.
 - Incremental mode audits only recent hourly files and imports newly found files.
@@ -70,9 +70,6 @@ ENCODINGS = ["utf-8-sig", "gbk", "utf-8"]
 
 # 每批写入多少行。
 BATCH_SIZE = 2000
-
-# CSV 文件时间使用中国标准时间。数据库字段类型应为 TIMESTAMPTZ。
-CSV_TIMEZONE = timezone(timedelta(hours=8), name="Asia/Shanghai")
 
 # 每扫描到多少个实际文件输出一次进度。
 SCAN_PROGRESS_EVERY = 1000
@@ -282,7 +279,6 @@ def parse_path_context(source_file_path: str) -> tuple[str, datetime, date]:
         month_number,
         day_number,
         hour_number,
-        tzinfo=CSV_TIMEZONE,
     )
     work_date = date(year_number, month_number, day_number)
 
