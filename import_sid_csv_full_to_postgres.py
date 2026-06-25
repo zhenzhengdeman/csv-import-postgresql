@@ -9,7 +9,7 @@ Key rules:
   col_01, col_02, col_05...
 - This script does not create the database or tables by default.
 - line is shortened from PT-L08 to L08.
-- csv_date is YYYYMMDDHH, parsed from folders and SIDTrace_HH.csv.
+- csv_date is a timezone-aware timestamp, parsed from folders and SIDTrace_HH.csv.
 - Full mode imports actual files first, then audits expected hourly files from
   AUDIT_START_DATE and writes status=missing when the file does not exist.
 - Incremental mode audits only recent hourly files and imports newly found files.
@@ -73,6 +73,9 @@ ENCODINGS = ["utf-8-sig", "gbk", "utf-8"]
 # 每批写入多少行。
 BATCH_SIZE = 2000
 
+# CSV 文件时间使用中国标准时间。数据库字段类型应为 TIMESTAMPTZ。
+CSV_TIMEZONE = timezone(timedelta(hours=8), name="Asia/Shanghai")
+
 # 每扫描到多少个实际文件输出一次进度。
 SCAN_PROGRESS_EVERY = 1000
 
@@ -113,7 +116,7 @@ EXPECTED_LINE_DIRS = [
 class FileMeta:
     source_file_path: str
     line: str
-    csv_date: str
+    csv_date: datetime | None
     work_date: date
 
 
@@ -244,7 +247,7 @@ def make_log_source_path(source_file_path: str) -> str:
     return PureWindowsPath(source_file_path).name
 
 
-def parse_path_context(source_file_path: str) -> tuple[str, str, date]:
+def parse_path_context(source_file_path: str) -> tuple[str, datetime, date]:
     win_path = PureWindowsPath(source_file_path)
     parts = win_path.parts
 
@@ -270,8 +273,18 @@ def parse_path_context(source_file_path: str) -> tuple[str, str, date]:
     if not 0 <= int(hour) <= 23:
         raise ValueError(f"小时不在 00-23 范围：{win_path.name}")
 
-    csv_date = f"{year}{month[1:]}{day[1:]}{hour}"
-    work_date = date(int(year), int(month[1:]), int(day[1:]))
+    year_number = int(year)
+    month_number = int(month[1:])
+    day_number = int(day[1:])
+    hour_number = int(hour)
+    csv_date = datetime(
+        year_number,
+        month_number,
+        day_number,
+        hour_number,
+        tzinfo=CSV_TIMEZONE,
+    )
+    work_date = date(year_number, month_number, day_number)
 
     return line, csv_date, work_date
 
@@ -305,7 +318,7 @@ def make_failed_meta(file_path: Path) -> FileMeta:
     return FileMeta(
         source_file_path=make_log_source_path(actual_file_path),
         line="",
-        csv_date="",
+        csv_date=None,
         work_date=date.min,
     )
 
@@ -517,7 +530,7 @@ def make_full_import_columns(csv_column_count: int) -> list[str]:
 def insert_batch(
     conn: psycopg.Connection,
     columns: Sequence[str],
-    rows: Sequence[Sequence[str]],
+    rows: Sequence[Sequence[object]],
 ) -> None:
     quoted_columns = ", ".join(quote_ident(column) for column in columns)
     placeholders = ", ".join(["%s"] * len(columns))
@@ -535,12 +548,15 @@ def import_one_file(conn: psycopg.Connection, file_path: Path, meta: FileMeta) -
     header, csv_rows = iter_csv_rows(file_path, encoding)
 
     row_count = 0
-    batch: list[list[str]] = []
+    batch: list[list[object]] = []
     insert_columns: list[str] | None = None
     expected_csv_columns: int | None = None
 
     if AUTO_CREATE_DATA_TABLE:
         ensure_data_table(conn)
+
+    if meta.csv_date is None:
+        raise ValueError(f"文件缺少有效的 csv_date：{file_path}")
 
     for csv_row in csv_rows:
         if insert_columns is None:
