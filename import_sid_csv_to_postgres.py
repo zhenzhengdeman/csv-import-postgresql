@@ -8,8 +8,8 @@ Key rules:
 - This script does not create the database or tables by default.
 - line is shortened from PT-L08 to L08.
 - csv_date is YYYYMMDDHH, parsed from folders and SIDTrace_HH.csv.
-- Full mode audits expected hourly files from AUDIT_START_DATE and writes
-  status=missing when the file does not exist.
+- Full mode imports actual files first, then audits expected hourly files from
+  AUDIT_START_DATE and writes status=missing when the file does not exist.
 - Incremental mode audits only recent hourly files and imports newly found files.
 
 Install dependency:
@@ -70,6 +70,12 @@ ENCODINGS = ["utf-8-sig", "gbk", "utf-8"]
 
 # 每批写入多少行。
 BATCH_SIZE = 2000
+
+# 每扫描到多少个实际文件输出一次进度。
+SCAN_PROGRESS_EVERY = 1000
+
+# 缺失文件审计每核对多少个理论文件输出一次进度。
+AUDIT_PROGRESS_EVERY = 50000
 
 # 文件最后修改时间距离当前时间小于这个值时跳过，避免导入未写完文件。
 FILE_STABLE_MINUTES = 5
@@ -185,10 +191,9 @@ def scan_sid_csv_files(root: str, pattern: str) -> Iterator[Path]:
     if not root_path.exists():
         raise FileNotFoundError(f"CSV 根目录不存在或无法访问：{root}")
 
-    yield from sorted(
-        (file for file in root_path.rglob(pattern) if file.is_file()),
-        key=lambda item: str(item).lower(),
-    )
+    for file_path in root_path.rglob(pattern):
+        if file_path.is_file():
+            yield file_path
 
 
 def should_process_by_mode(meta: FileMeta, mode: str) -> bool:
@@ -335,18 +340,16 @@ def detect_encoding(file_path: Path) -> str:
     )
 
 
-def already_imported_success(conn: psycopg.Connection, source_file_path: str) -> bool:
+def load_import_log_statuses(conn: psycopg.Connection) -> dict[str, str]:
+    """Load file statuses once to avoid one database query per CSV file."""
     with conn.cursor() as cur:
         cur.execute(
             f"""
-            SELECT status
+            SELECT source_file_path, status
             FROM {table_ref(IMPORT_LOG_TABLE)}
-            WHERE source_file_path = %s
-            """,
-            (source_file_path,),
+            """
         )
-        row = cur.fetchone()
-    return bool(row and row[0] == "success")
+        return {source_file_path: status for source_file_path, status in cur}
 
 
 def mark_importing(conn: psycopg.Connection, meta: FileMeta) -> None:
@@ -568,10 +571,13 @@ def parse_args() -> argparse.Namespace:
 def run() -> int:
     args = parse_args()
     started = datetime.now(timezone.utc)
+    scanned_files = 0
     imported_files = 0
     skipped_files = 0
     failed_files = 0
     missing_files = 0
+    newly_logged_missing_files = 0
+    actual_source_paths: set[str] = set()
 
     if not AUTO_CREATE_IMPORT_LOG_TABLE and not AUTO_CREATE_DATA_TABLE:
         print("提示：脚本不会自动建库建表，请确认数据库、import_log 和数据表已提前创建。")
@@ -583,66 +589,116 @@ def run() -> int:
         if AUTO_CREATE_IMPORT_LOG_TABLE:
             ensure_import_log_table(conn)
 
-        if AUDIT_MISSING_FILES:
-            missing_batch: list[FileMeta] = []
-            for expected_path in iter_expected_files(args.mode):
-                if expected_path.exists():
-                    continue
+        print("[准备] 正在读取 import_log 状态...", flush=True)
+        log_statuses = load_import_log_statuses(conn)
+        print(f"[准备] 已读取 {len(log_statuses)} 条导入日志。", flush=True)
 
-                expected_meta = make_expected_meta(expected_path)
-                missing_batch.append(expected_meta)
-                missing_files += 1
-
-                if len(missing_batch) >= BATCH_SIZE:
-                    mark_missing_batch(conn, missing_batch)
-                    missing_batch.clear()
-
-            if missing_batch:
-                mark_missing_batch(conn, missing_batch)
-
+        print("[阶段 1/2] 开始扫描实际存在的 SID 文件，扫描到后立即处理。", flush=True)
         for file_path in scan_sid_csv_files(CSV_ROOT, FILE_PATTERN):
+            scanned_files += 1
             try:
-                if not is_file_stable(file_path):
-                    skipped_files += 1
-                    continue
-
                 try:
                     meta = parse_meta(file_path)
                 except Exception as exc:
                     failed_meta = make_failed_meta(file_path)
+                    actual_source_paths.add(failed_meta.source_file_path)
                     mark_failed(conn, failed_meta, exc)
+                    log_statuses[failed_meta.source_file_path] = "failed"
                     failed_files += 1
                     print(f"[failed] {file_path} error={exc}", file=sys.stderr)
                     continue
+
+                actual_source_paths.add(meta.source_file_path)
 
                 if not should_process_by_mode(meta, args.mode):
                     skipped_files += 1
                     continue
 
-                if already_imported_success(conn, meta.source_file_path):
+                if not is_file_stable(file_path):
+                    skipped_files += 1
+                    continue
+
+                if log_statuses.get(meta.source_file_path) == "success":
                     skipped_files += 1
                     continue
 
                 mark_importing(conn, meta)
+                log_statuses[meta.source_file_path] = "importing"
 
                 try:
                     row_count = import_one_file(conn, file_path, meta)
                     conn.commit()
+                    log_statuses[meta.source_file_path] = "success"
                     imported_files += 1
                     print(f"[success] {meta.source_file_path} rows={row_count}")
                 except Exception as exc:
                     conn.rollback()
                     mark_failed(conn, meta, exc)
+                    log_statuses[meta.source_file_path] = "failed"
                     failed_files += 1
                     print(f"[failed] {meta.source_file_path} error={exc}", file=sys.stderr)
 
             except Exception as exc:
                 failed_files += 1
                 print(f"[failed] {file_path} error={exc}", file=sys.stderr)
+            finally:
+                if scanned_files % SCAN_PROGRESS_EVERY == 0:
+                    print(
+                        f"[扫描进度] 已发现 {scanned_files} 个文件，"
+                        f"导入 {imported_files}，跳过 {skipped_files}，失败 {failed_files}。",
+                        flush=True,
+                    )
+
+        print(
+            f"[阶段 1/2] 实际文件扫描完成：发现 {scanned_files} 个，"
+            f"导入 {imported_files}，跳过 {skipped_files}，失败 {failed_files}。",
+            flush=True,
+        )
+
+        if AUDIT_MISSING_FILES:
+            print("[阶段 2/2] 开始根据扫描结果补充缺失文件日志。", flush=True)
+            missing_batch: list[FileMeta] = []
+            expected_checked = 0
+
+            for expected_path in iter_expected_files(args.mode):
+                expected_checked += 1
+                expected_meta = make_expected_meta(expected_path)
+
+                if expected_meta.source_file_path in actual_source_paths:
+                    pass
+                else:
+                    missing_files += 1
+                    current_status = log_statuses.get(expected_meta.source_file_path)
+                    if current_status not in {"success", "missing"}:
+                        missing_batch.append(expected_meta)
+                        log_statuses[expected_meta.source_file_path] = "missing"
+                        newly_logged_missing_files += 1
+
+                if len(missing_batch) >= BATCH_SIZE:
+                    mark_missing_batch(conn, missing_batch)
+                    missing_batch.clear()
+
+                if expected_checked % AUDIT_PROGRESS_EVERY == 0:
+                    print(
+                        f"[审计进度] 已核对 {expected_checked} 个理论文件，"
+                        f"当前缺失 {missing_files}，新增缺失日志 {newly_logged_missing_files}。",
+                        flush=True,
+                    )
+
+            if missing_batch:
+                mark_missing_batch(conn, missing_batch)
+
+            print(
+                f"[阶段 2/2] 缺失审计完成：核对 {expected_checked} 个理论文件，"
+                f"缺失 {missing_files}，新增缺失日志 {newly_logged_missing_files}。",
+                flush=True,
+            )
 
     elapsed = datetime.now(timezone.utc) - started
     print(
-        f"完成：导入文件 {imported_files} 个，跳过 {skipped_files} 个，缺失 {missing_files} 个，失败 {failed_files} 个，用时 {elapsed}"
+        f"完成：扫描 {scanned_files} 个，导入 {imported_files} 个，跳过 {skipped_files} 个，"
+        f"缺失 {missing_files} 个，新增缺失日志 {newly_logged_missing_files} 个，"
+        f"失败 {failed_files} 个，用时 {elapsed}"
     )
     return 0 if failed_files == 0 else 1
 
